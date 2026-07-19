@@ -8,7 +8,7 @@ description: Manage Claude Code background agents (the `claude agents` / FleetVi
 Background agents are sessions managed by the Claude Code daemon. There are two data sources.
 
 1. The CLI, which is stable, so prefer it: `claude agents --json` lists live sessions (interactive and background) with `pid`, `id`, `name`, `status` (`busy`/`waiting`/`idle`), `state` (`working`/`blocked`/`done`), `sessionId`, `cwd`, and `startedAt`. Add `--all` to include completed background sessions. Works without a TTY.
-2. The files, which are the source of truth and the only route for mutations: one directory per job under the jobs root. Resolve paths portably:
+2. The files, which are the source of truth for names and cleanup: one directory per job under the jobs root. Resolve paths portably:
 
 ```bash
 CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
@@ -16,7 +16,9 @@ JOBS_DIR="$CONFIG_DIR/jobs"            # $JOBS_DIR/<8-char-id>/{state.json,timel
 PROJECTS_DIR="$CONFIG_DIR/projects"    # transcripts live here (see below)
 ```
 
-The `state.json` fields that matter: `state` (`working`/`blocked`/`done`), `name`, `nameSource` (`auto`/`user`), `detail` (last user message or status line), `output` (final `result` for done jobs), `sessionId`, `intent` (original prompt), `cwd`, `createdAt`/`updatedAt`.
+Stopping a running job goes through a third channel, the daemon's control socket; see "Stop a running agent" below.
+
+The `state.json` fields that matter: `state` (`working`/`blocked`/`done`, plus `stopped` after a daemon-level kill), `name`, `nameSource` (`auto`/`user`), `detail` (last user message or status line), `output` (final `result` for done jobs), `sessionId`, `intent` (original prompt), `cwd`, `createdAt`/`updatedAt`.
 
 A job's full conversation transcript is not in the job dir. It lives at:
 
@@ -27,7 +29,7 @@ ls "$PROJECTS_DIR"/*/"<sessionId>".jsonl
 
 If the user's `claude` is an alias with extra flags, call the real binary via `command claude ...` or `$(which -p claude)`.
 
-Verified against Claude Code 2.1.215. The file formats are internal. If a recipe stops working on a newer version, re-verify against the binary before trusting it (e.g. `strings "$(readlink -f "$(command -v claude)")" | grep -i agentColor`).
+Verified against Claude Code 2.1.215 (daemon control protocol 1). The file formats are internal. If a recipe stops working on a newer version, re-verify against the binary before trusting it (e.g. `strings "$(readlink -f "$(command -v claude)")" | grep -i agentColor`).
 
 ## Spawn a new agent
 
@@ -117,18 +119,50 @@ Locate the file by globbing for the sessionId as shown above. Colors render in t
 
 ## Stop a running agent
 
-`claude agents --json` gives the `pid`. Send SIGTERM (`kill <pid>`), then confirm it's gone. Only kill jobs whose `kind` is `background`. Never kill an `interactive` session; that's a terminal the user has open.
+There is no public stop subcommand, and killing the worker's OS pid (from `claude agents --json`) is unreliable. The daemon treats an untracked exit as a crash, and its reconciliation passes (`bg adopt: adopted=N respawned=N dead=N` in `$CONFIG_DIR/daemon.log`) can respawn the job with the same `sessionId`, original `createdAt`, and `cwd`, using the `template`/`respawnFlags` cached in its records. Deleting the job directory doesn't stop anything either, and `claude daemon stop` is far too blunt: it shuts down the whole daemon and every background session with it.
 
-Killing the pid is not always the end of the job. The daemon runs periodic reconciliation passes (`bg adopt: adopted=N respawned=N dead=N` in `$CONFIG_DIR/daemon.log`), especially right after a daemon restart or upgrade. If the job still has unfinished work — check its `fan` array in `state.json` for open `todo`/`agent` entries — a plain OS-level kill looks like a crash rather than an intentional stop, and the daemon can respawn a new worker process for the same `sessionId` using the job's cached `template`/`respawnFlags`. The respawned job looks identical to the original: same `sessionId`, same original `createdAt`, same `cwd`, including any un-isolated `cwd` the job started in. It's easy to mistake for the same still-running job rather than a resurrection.
-
-To confirm a job is actually dead, don't trust the job list alone:
+The reliable stop is the daemon's own `kill` operation over its control socket, the same path the agents UI uses. `command claude daemon status` prints the socket's directory as `sock dir`; on macOS and Linux it looks like `/tmp/cc-daemon-<uid>/<hash>` (Windows uses named pipes instead, so this recipe is unix-only). The protocol is one JSON line per request and one JSON line back, and a protocol mismatch error names the version the server wants, so negotiate by retrying:
 
 ```bash
-ps aux | grep "<sessionId>" | grep -v grep   # any survivors?
-grep "settled <id>" "$CONFIG_DIR/daemon.log" | tail -1   # look for "(killed)" or "(done)"
+python3 - <jobId> [SIGTERM|SIGKILL] <<'EOF'
+import glob, json, os, socket, sys
+job = sys.argv[1]
+sig = sys.argv[2] if len(sys.argv) > 2 else "SIGTERM"
+
+def call(path, req):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(path)
+    s.sendall(json.dumps(req).encode() + b"\n")
+    buf = b""
+    while not buf.endswith(b"\n"):
+        c = s.recv(65536)
+        if not c:
+            break
+        buf += c
+    s.close()
+    return json.loads(buf)
+
+socks = glob.glob(f"/tmp/cc-daemon-{os.getuid()}/*/control.sock")
+assert socks, "no control socket found; run `claude daemon status` for the sock dir"
+for sock in socks:
+    r = call(sock, {"proto": 1, "op": "kill", "short": job, "signal": sig})
+    if not r.get("ok") and r.get("code") == "EPROTO":
+        r = call(sock, {"proto": r["serverProto"], "op": "kill", "short": job, "signal": sig})
+    print(sock, "->", r)
+EOF
 ```
 
-If a process matching the sessionId reappears after you killed it, kill it again and re-check. Deleting the job directory does not stop a live worker; it only removes the daemon's cache file for it.
+`{"ok": true, "op": "kill"}` means the daemon settled the job on purpose: it logs `bg settled <id> (killed)`, flips the job's `state.json` to `"state": "stopped"`, and will not respawn it. `ENOJOB` means that daemon doesn't own the job (already exited, or the wrong `<hash>` dir when several exist). This path only reaches background workers; interactive sessions have no 8-character job id, so there is no way to hit an open terminal by mistake.
+
+Verify against daemon truth, not the job list:
+
+```bash
+grep "settled <id>" "$CONFIG_DIR/daemon.log" | tail -1   # expect "(killed)"
+ps aux | grep "<sessionId>" | grep -v grep               # expect no survivors
+```
+
+The same socket answers a read-only liveness probe, useful when the job list looks stale: `{"proto": <P>, "op": "has", "short": "<id>"}` returns `"alive": true` only for a running worker. A raw `kill <pid>` remains the fallback when the control socket is gone; after using it, expect no `settled` line, and check again later for a respawned worker.
 
 ## Delete and clean up agents
 
@@ -141,7 +175,7 @@ rm -rf "$JOBS_DIR/<id>"
 Rules:
 
 - Always confirm with the user before deleting, listing exactly which jobs will go.
-- If the job is still running (has a live pid in `claude agents --json`), stop it first, and verify it actually stopped before deleting. Deleting the directory alone does nothing to a live worker, and it can get re-adopted with a fresh `state.json` on the next reconciliation pass.
+- Stop running jobs first with the control-socket kill above, and wait for the `settled <id> (killed)` line before deleting. Deleting the directory of a live worker does nothing to the process, and the daemon rewrites `state.json` from its own records on the next reconciliation pass, so the job appears to come back.
 - Deleting the job dir keeps the transcript in `$PROJECTS_DIR`, so the session remains resumable via `claude --resume <sessionId>`. Only delete the transcript too if the user explicitly wants the conversation gone.
 - Job dirs without a `state.json` are stale leftovers, safe to offer for cleanup.
 - Don't touch `$JOBS_DIR/pins.json` (UI pin state).
