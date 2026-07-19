@@ -117,7 +117,18 @@ Locate the file by globbing for the sessionId as shown above. Colors render in t
 
 ## Stop a running agent
 
-`claude agents --json` gives the `pid`. Send SIGTERM (`kill <pid>`), then confirm it's gone from the list. Only kill jobs whose `kind` is `background`. Never kill an `interactive` session; that's a terminal the user has open.
+`claude agents --json` gives the `pid`. Send SIGTERM (`kill <pid>`), then confirm it's gone. Only kill jobs whose `kind` is `background`. Never kill an `interactive` session; that's a terminal the user has open.
+
+Killing the pid is not always the end of the job. The daemon runs periodic reconciliation passes (`bg adopt: adopted=N respawned=N dead=N` in `$CONFIG_DIR/daemon.log`), especially right after a daemon restart or upgrade. If the job still has unfinished work — check its `fan` array in `state.json` for open `todo`/`agent` entries — a plain OS-level kill looks like a crash rather than an intentional stop, and the daemon can respawn a new worker process for the same `sessionId` using the job's cached `template`/`respawnFlags`. The respawned job looks identical to the original: same `sessionId`, same original `createdAt`, same `cwd`, including any un-isolated `cwd` the job started in. It's easy to mistake for the same still-running job rather than a resurrection.
+
+To confirm a job is actually dead, don't trust the job list alone:
+
+```bash
+ps aux | grep "<sessionId>" | grep -v grep   # any survivors?
+grep "settled <id>" "$CONFIG_DIR/daemon.log" | tail -1   # look for "(killed)" or "(done)"
+```
+
+If a process matching the sessionId reappears after you killed it, kill it again and re-check. Deleting the job directory does not stop a live worker; it only removes the daemon's cache file for it.
 
 ## Delete and clean up agents
 
@@ -130,7 +141,7 @@ rm -rf "$JOBS_DIR/<id>"
 Rules:
 
 - Always confirm with the user before deleting, listing exactly which jobs will go.
-- If the job is still running (has a live pid in `claude agents --json`), stop it first.
+- If the job is still running (has a live pid in `claude agents --json`), stop it first, and verify it actually stopped before deleting. Deleting the directory alone does nothing to a live worker, and it can get re-adopted with a fresh `state.json` on the next reconciliation pass.
 - Deleting the job dir keeps the transcript in `$PROJECTS_DIR`, so the session remains resumable via `claude --resume <sessionId>`. Only delete the transcript too if the user explicitly wants the conversation gone.
 - Job dirs without a `state.json` are stale leftovers, safe to offer for cleanup.
 - Don't touch `$JOBS_DIR/pins.json` (UI pin state).
