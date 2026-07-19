@@ -55,7 +55,48 @@ for f in sorted(glob.glob(os.path.join(jobs_dir, "*", "state.json"))):
 EOF
 ```
 
-For "what has agent X actually been doing", read its transcript. It is JSONL; each line has a `type` of `user`/`assistant`/etc., with `message.content` as a string or a list of blocks (collect the `text` blocks). Summarize the tail; don't dump raw lines at the user. For long transcripts, delegate reading to a subagent and keep only the summary.
+## Read a job's conversation (transcript tail)
+
+For "what has agent X actually been doing", read its transcript. It is JSONL; each line has a `type` of `user`/`assistant`/etc., with `message.content` as a string or a list of blocks (collect the `text` blocks).
+
+Gotcha: the sessionId in `state.json` sometimes points at a file holding only `ai-title`/`agent-name` events, with the real conversation under a different sessionId (this happens when a job was dispatched into or respawned from an existing conversation). The recipe below handles that by falling back to matching the job's `intent` against user messages:
+
+```bash
+python3 - <jobId> [numMessages] <<'EOF'
+import json, glob, os, sys
+cfg = os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
+job, n = sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 8
+st = json.load(open(os.path.join(cfg, "jobs", job, "state.json")))
+
+def msgs(path):
+    out = []
+    for line in open(path):
+        try: e = json.loads(line)
+        except: continue
+        if e.get("type") not in ("user", "assistant") or e.get("isMeta"): continue
+        c = e.get("message", {}).get("content")
+        if isinstance(c, list):
+            c = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+        if isinstance(c, str) and c.strip():
+            out.append((e["type"], c.strip().replace("\n", " ")))
+    return out
+
+paths = glob.glob(os.path.join(cfg, "projects", "*", st["sessionId"] + ".jsonl"))
+m = msgs(paths[0]) if paths else []
+if not m:  # fallback: find the file whose user messages contain the job's intent
+    intent = (st.get("intent") or "")[:80]
+    for p in sorted(glob.glob(os.path.join(cfg, "projects", "*", "*.jsonl")), key=os.path.getmtime, reverse=True):
+        mm = msgs(p)
+        if intent and any(r == "user" and intent in t for r, t in mm):
+            m, paths = mm, [p]; break
+
+print(f"{paths[0] if paths else 'transcript not found'} ({len(m)} messages)")
+for role, text in m[-n:]:
+    print(f"{role:9}: {text[:200]}")
+EOF
+```
+
+Summarize the tail; don't dump raw lines at the user. For long transcripts, delegate reading to a subagent and keep only the summary. Live sessions can also lag: a just-started job may not have flushed any user/assistant lines yet, while its `state.json` `detail` already shows the latest exchange, so check `detail` first for very young jobs.
 
 ## Rename an agent (title)
 
